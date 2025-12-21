@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Neon Night Rider: Cyber-Wedge Edition</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; touch-action: none; }
+        canvas { display: block; }
+        
+        /* CRT Scanline & Vignette Overlay */
+        #crt-overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: 
+                radial-gradient(circle, rgba(0,0,0,0) 60%, rgba(0,0,0,0.6) 100%),
+                linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%);
+            background-size: 100% 100%, 100% 4px;
+            pointer-events: none; z-index: 10;
+        }
+
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            z-index: 20; pointer-events: none;
+        }
+
+        #start-screen {
+            background: rgba(0,0,0,0.8); padding: 30px; border: 2px solid #0ff;
+            text-align: center; color: #fff; pointer-events: auto; cursor: pointer;
+            box-shadow: 0 0 20px #0ff; max-width: 80%;
+        }
+        
+        h1 { margin: 0 0 10px 0; font-size: 32px; color: #f0f; text-shadow: 2px 2px #0ff; text-transform: uppercase; font-style: italic; }
+        p { color: #0ff; font-size: 16px; margin: 5px 0; }
+        .controls { color: #fff; font-size: 14px; margin-top: 15px; border-top: 1px solid #0ff; padding-top: 10px;}
+        
+        #hud {
+            position: absolute; top: 20px; left: 20px;
+            color: #0ff; font-size: 20px; font-weight: bold;
+            text-shadow: 0 0 5px #0ff; display: none; z-index: 15;
+        }
+        
+        .hidden { display: none !important; }
+        
+        /* Glitch animation for crashes */
+        @keyframes glitch {
+            0% { transform: translate(0) } 20% { transform: translate(-5px, 5px) }
+            40% { transform: translate(-5px, -5px) } 60% { transform: translate(5px, 5px) }
+            80% { transform: translate(5px, -5px) } 100% { transform: translate(0) }
+        }
+        .crashed { animation: glitch 0.2s infinite; filter: hue-rotate(90deg); }
+    </style>
+</head>
+<body>
+
+    <div id="crt-overlay"></div>
+    
+    <div id="ui-layer">
+        <div id="start-screen">
+            <h1>Neon Night Rider</h1>
+            <p>CYBER-WEDGE EDITION</p>
+            <p>TAP TO START ENGINE</p>
+            <div class="controls">
+                DESKTOP: Arrow Keys<br>
+                MOBILE: Tap Left/Right side of screen
+            </div>
+        </div>
+    </div>
+
+    <div id="hud">
+        SCORE: <span id="score">0</span>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+        // --- GLOBAL VARIABLES ---
+        let scene, camera, renderer, analyser;
+        let carGroup, sun, gridHelper;
+        let obstacles = [];
+        let gameActive = false;
+        let score = 0;
+        let speed = 0.8;
+        let carX = 0;
+        // We keep the keys object as the central truth for input
+        const keys = { ArrowLeft: false, ArrowRight: false };
+        
+        // --- AUDIO ENGINE (Procedural Synthwave) ---
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const masterGain = audioCtx.createGain();
+        masterGain.gain.value = 0.3;
+        masterGain.connect(audioCtx.destination);
+        const audioAnalyser = audioCtx.createAnalyser();
+        audioAnalyser.fftSize = 64; 
+        masterGain.connect(audioAnalyser);
+
+        function playKick(time) {
+            const osc = audioCtx.createOscillator(); const gain = audioCtx.createGain();
+            osc.frequency.setValueAtTime(150, time); osc.frequency.exponentialRampToValueAtTime(0.01, time + 0.5);
+            gain.gain.setValueAtTime(1, time); gain.gain.exponentialRampToValueAtTime(0.01, time + 0.5);
+            osc.connect(gain); gain.connect(masterGain); osc.start(time); osc.stop(time + 0.5);
+        }
+
+        function playSnare(time) {
+            const bufferSize = audioCtx.sampleRate * 0.5; const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0); for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+            const noise = audioCtx.createBufferSource(); noise.buffer = buffer;
+            const noiseFilter = audioCtx.createBiquadFilter(); noiseFilter.type = 'highpass'; noiseFilter.frequency.value = 1000;
+            const gain = audioCtx.createGain(); gain.gain.setValueAtTime(0.5, time); gain.gain.exponentialRampToValueAtTime(0.01, time + 0.2);
+            noise.connect(noiseFilter); noiseFilter.connect(gain); gain.connect(masterGain); noise.start(time);
+        }
+
+        function playBass(time, freq) {
+            const osc = audioCtx.createOscillator(); osc.type = 'sawtooth'; osc.frequency.setValueAtTime(freq, time);
+            const filter = audioCtx.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.setValueAtTime(500, time); filter.frequency.linearRampToValueAtTime(100, time + 0.2);
+            const gain = audioCtx.createGain(); gain.gain.setValueAtTime(0.3, time); gain.gain.linearRampToValueAtTime(0, time + 0.2);
+            osc.connect(filter); filter.connect(gain); gain.connect(masterGain); osc.start(time); osc.stop(time + 0.2);
+        }
+
+        let nextNoteTime = 0; let step = 0;
+        function scheduleAudio() {
+            while (nextNoteTime < audioCtx.currentTime + 0.1) {
+                if (step % 4 === 0) playKick(nextNoteTime);
+                if (step % 8 === 4) playSnare(nextNoteTime);
+                const bassNote = (step < 8) ? 65.41 : 58.27; 
+                playBass(nextNoteTime, bassNote);
+                nextNoteTime += (60.0 / 110.0) / 4;
+                step = (step + 1) % 16;
+            }
+            if(gameActive) requestAnimationFrame(scheduleAudio);
+        }
+
+        // --- THREE.JS SCENE SETUP ---
+        function init() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x2d1b4e, 0.015);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 3, 9); // Closer camera for sports car feel
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            // Important for touch controls on mobile not to scroll page
+            renderer.domElement.style.touchAction = 'none'; 
+            document.body.appendChild(renderer.domElement);
+
+            // SUN
+            const sunCanvas = document.createElement('canvas');
+            sunCanvas.width = 512; sunCanvas.height = 512;
+            const ctx = sunCanvas.getContext('2d');
+            const grd = ctx.createLinearGradient(0, 0, 0, 512);
+            grd.addColorStop(0, '#ffff00'); grd.addColorStop(1, '#ff0080');
+            ctx.fillStyle = grd; ctx.fillRect(0, 0, 512, 512);
+            ctx.fillStyle = 'rgba(0,0,0,0.3)';
+            for (let y = 256; y < 512; y += 20) ctx.fillRect(0, y, 512, (y - 256) / 10);
+            
+            const sunGeo = new THREE.CircleGeometry(50, 64);
+            const sunMat = new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(sunCanvas), transparent: true, fog: false });
+            sun = new THREE.Mesh(sunGeo, sunMat);
+            sun.position.set(0, 20, -150);
+            scene.add(sun);
+
+            // GRID
+            gridHelper = new THREE.GridHelper(400, 60, 0xff00ff, 0x2d1b4e);
+            gridHelper.position.set(0, -1, -100);
+            scene.add(gridHelper);
+            
+            // REFLECTIVE PLANE
+            const planeGeo = new THREE.PlaneGeometry(400, 400);
+            const planeMat = new THREE.MeshBasicMaterial({ color: 0x110022 });
+            const plane = new THREE.Mesh(planeGeo, planeMat);
+            plane.rotation.x = -Math.PI / 2;
+            plane.position.y = -1.1;
+            scene.add(plane);
+
+            createSportsCar();
+            
+            // LIGHTING
+            const ambient = new THREE.AmbientLight(0xffffff, 0.3);
+            scene.add(ambient);
+            // Stronger rim light for the car
+            const dirLight = new THREE.DirectionalLight(0x00ffff, 2);
+            dirLight.position.set(5, 5, -5);
+            scene.add(dirLight);
+            // Warm light from the sun
+            const sunLight = new THREE.DirectionalLight(0xff0080, 1);
+            sunLight.position.set(0, 10, -20);
+            scene.add(sunLight);
+        }
+
+        // --- NEW 80s SPORTS CAR MODEL ---
+        function createSportsCar() {
+            carGroup = new THREE.Group();
+            
+            const carBodyMat = new THREE.MeshStandardMaterial({ 
+                color: 0x00aaff, 
+                roughness: 0.3, 
+                metalness: 0.8,
+                flatShading: true // Retro low-poly look
+            });
+            const blackMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+            const glowMat = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+            const tailLightMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+
+            // 1. Main Wedge Chassis
+            const chassisGeo = new THREE.BoxGeometry(2.2, 0.6, 4.5);
+            const chassis = new THREE.Mesh(chassisGeo, carBodyMat);
+            chassis.position.y = 0.3;
+            // Taper front slightly (simple hack by scaling geometry)
+            chassis.geometry.verticesNeedUpdate = true;
+            carGroup.add(chassis);
+
+            // 2. Cabin (Sloped backwards)
+            const cabinGeo = new THREE.BoxGeometry(1.8, 0.7, 2);
+            const cabin = new THREE.Mesh(cabinGeo, carBodyMat);
+            cabin.position.set(0, 0.8, 0.5);
+            // Fake windshield using a black plane sloping back
+            const windGeo = new THREE.PlaneGeometry(1.6, 0.8);
+            const windshield = new THREE.Mesh(windGeo, blackMat);
+            windshield.rotation.x = -Math.PI / 3;
+            windshield.position.set(0, 1.0, -0.45);
+            cabin.add(windshield);
+            carGroup.add(cabin);
+
+            // 3. Rear Spoiler (Big wing)
+            const spoilerStandGeo = new THREE.BoxGeometry(0.1, 0.4, 0.3);
+            const standL = new THREE.Mesh(spoilerStandGeo, carBodyMat); standL.position.set(-0.8, 0.8, 2);
+            const standR = new THREE.Mesh(spoilerStandGeo, carBodyMat); standR.position.set(0.8, 0.8, 2);
+            const spoilerWingGeo = new THREE.BoxGeometry(2.4, 0.1, 0.6);
+            const wing = new THREE.Mesh(spoilerWingGeo, carBodyMat); wing.position.set(0, 1.1, 2.1);
+            carGroup.add(standL, standR, wing);
+
+            // 4. Neon Strips & Accents
+            const sideGlowGeo = new THREE.BoxGeometry(2.3, 0.05, 4.6);
+            const sideGlow = new THREE.Mesh(sideGlowGeo, glowMat);
+            sideGlow.position.y = 0.1;
+            carGroup.add(sideGlow);
+
+            // 5. Tail Lights
+            const tailGeo = new THREE.BoxGeometry(0.8, 0.15, 0.1);
+            const tailL = new THREE.Mesh(tailGeo, tailLightMat); tailL.position.set(-0.6, 0.5, 2.26);
+            const tailR = new THREE.Mesh(tailGeo, tailLightMat); tailR.position.set(0.6, 0.5, 2.26);
+            carGroup.add(tailL, tailR);
+
+            // 6. Simple wheels (black cylinders)
+            const wheelGeo = new THREE.CylinderGeometry(0.4, 0.4, 0.2, 16);
+            wheelGeo.rotateZ(Math.PI/2);
+            const w1 = new THREE.Mesh(wheelGeo, blackMat); w1.position.set(-1.1, 0, -1.5);
+            const w2 = new THREE.Mesh(wheelGeo, blackMat); w2.position.set(1.1, 0, -1.5);
+            const w3 = new THREE.Mesh(wheelGeo, blackMat); w3.position.set(-1.1, 0, 1.5);
+            const w4 = new THREE.Mesh(wheelGeo, blackMat); w4.position.set(1.1, 0, 1.5);
+            carGroup.add(w1,w2,w3,w4);
+
+            scene.add(carGroup);
+        }
+
+        function spawnObstacle() {
+            const geo = new THREE.BoxGeometry(1, 8, 1);
+            const mat = new THREE.MeshBasicMaterial({ color: Math.random() > 0.5 ? 0xff00ff : 0x00ff00 });
+            const obs = new THREE.Mesh(geo, mat);
+            const xPos = (Math.random() * 30) - 15;
+            obs.position.set(xPos, 4, -150);
+            const edges = new THREE.EdgesGeometry(geo);
+            const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffffff }));
+            obs.add(line);
+            scene.add(obs);
+            obstacles.push(obs);
+        }
+
+        // --- INPUT HANDLING (KEYBOARD & TOUCH) ---
+        
+        // Keyboard
+        window.addEventListener('keydown', e => keys[e.code] = true);
+        window.addEventListener('keyup', e => keys[e.code] = false);
+
+        // Touch Controls
+        function handleTouch(e) {
+            if(!gameActive) return;
+            // prevent default browser scrolling/zooming behavior
+            e.preventDefault(); 
+            
+            // Reset keys state first
+            keys.ArrowLeft = false;
+            keys.ArrowRight = false;
+
+            // Iterate through all active touch points
+            for(let i=0; i < e.touches.length; i++) {
+                const touchX = e.touches[i].clientX;
+                const halfWidth = window.innerWidth / 2;
+                
+                if (touchX < halfWidth) {
+                    keys.ArrowLeft = true;
+                } else {
+                    keys.ArrowRight = true;
+                }
+            }
+        }
+
+        // Listen for touch start and move to sustain steering
+        window.addEventListener('touchstart', handleTouch, { passive: false });
+        window.addEventListener('touchmove', handleTouch, { passive: false });
+        
+        // Reset on touch end
+        window.addEventListener('touchend', (e) => {
+             if(e.touches.length === 0) {
+                 keys.ArrowLeft = false;
+                 keys.ArrowRight = false;
+             } else {
+                 // If fingers are still down, re-evaluate (handles multi-touch lift-off)
+                 handleTouch(e);
+             }
+        });
+
+
+        // Start Handler
+        document.getElementById('start-screen').addEventListener('click', startGame);
+        // Add touchstart for faster mobile response on the start button
+        document.getElementById('start-screen').addEventListener('touchstart', startGame, {passive: false}); 
+
+        function startGame(e) {
+            if(gameActive) return; // prevent double start
+            if(e.type === 'touchstart') e.preventDefault();
+            document.getElementById('start-screen').classList.add('hidden');
+            document.getElementById('hud').style.display = 'block';
+            audioCtx.resume();
+            nextNoteTime = audioCtx.currentTime + 0.1;
+            gameActive = true;
+            scheduleAudio();
+            animate();
+        }
+
+        function animate() {
+            if (!gameActive) return;
+            requestAnimationFrame(animate);
+
+            // Visualizer
+            const dataArray = new Uint8Array(audioAnalyser.frequencyBinCount);
+            audioAnalyser.getByteFrequencyData(dataArray);
+            let sum = 0; for(let i=0; i<5; i++) sum += dataArray[i];
+            const bass = sum / 5;
+            const scale = 1 + (bass / 256) * 0.4;
+            sun.scale.set(scale, scale, 1);
+            
+            // Movement
+            gridHelper.position.z += speed;
+            if (gridHelper.position.z > 0) gridHelper.position.z = -50;
+
+            // Car Physics
+            if (keys.ArrowLeft) carX -= 0.3;
+            if (keys.ArrowRight) carX += 0.3;
+            carX = Math.max(-16, Math.min(16, carX));
+            
+            carGroup.position.x += (carX - carGroup.position.x) * 0.15; // Faster steering response
+            carGroup.rotation.z = (carGroup.position.x - carX) * 0.3; 
+            carGroup.rotation.y = (carX - carGroup.position.x) * 0.05; 
+            // Base height + slight bounce on beat
+            carGroup.position.y = 0.3 + (bass / 256) * 0.1; 
+
+            // Obstacles
+            if (Math.random() < 0.02 + (score * 0.0001)) spawnObstacle();
+
+            const carBox = new THREE.Box3().setFromObject(carGroup);
+            carBox.expandByScalar(-0.7); // Tighter hitbox for the new car model
+
+            for (let i = obstacles.length - 1; i >= 0; i--) {
+                const obs = obstacles[i];
+                obs.position.z += speed;
+                if (carBox.intersectsBox(new THREE.Box3().setFromObject(obs))) gameOver();
+                if (obs.position.z > 10) {
+                    scene.remove(obs); obstacles.splice(i, 1);
+                    score += 10; document.getElementById('score').innerText = score;
+                    speed += 0.0005;
+                }
+            }
+            renderer.render(scene, camera);
+        }
+
+        function gameOver() {
+            gameActive = false;
+            document.body.classList.add('crashed');
+            document.getElementById('hud').innerHTML = `CRASHED! FINAL SCORE: ${score}<br><span style="font-size:14px">Refresh to retry</span>`;
+            masterGain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 1);
+        }
+        
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        init();
+    </script>
+</body>
+</html>
